@@ -1,0 +1,36 @@
+# Python bytecode and tooling caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local app data and runtime logs
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Local planning and visual source assets (kept out of the GitHub repo)
+/ULTRON_blueprint*.md
+/ULTRON UI Concepts.pdf
+/ULTRON UI Concepts-png/
+/ultron-icons/
