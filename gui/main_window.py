@@ -1,291 +1,697 @@
-import json
+from __future__ import annotations
+
 import html
+import json
 import re
-from pathlib import Path
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QEvent
-from PySide6.QtGui import QIcon, QFont, QColor
-from PySide6.QtWidgets import (QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,QLabel,QPushButton,QListWidget,QListWidgetItem,QTextBrowser,QTextEdit,QLineEdit,QFrame,QProgressBar,QDialog,QDialogButtonBox,QFormLayout,QComboBox,QCheckBox,QMessageBox,QTableWidget,QTableWidgetItem,QHeaderView,QFileDialog)
-from config import APP_NAME,MODEL,OLLAMA_HOST,DATA_DIR,DATABASE,ALLOWED_ROOTS
+
+from PySide6.QtCore import QEvent, Qt, QThreadPool, QTimer
+from PySide6.QtGui import QAction, QFont, QIcon, QTextDocument
+from PySide6.QtWidgets import (QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon,
+                               QMenu, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
+
+from config import APP_NAME, ASSETS, DATABASE, LOCAL_MODEL, MODEL_CACHE, OLLAMA_URL, VOICE_NOTES, load_providers
+from core.assistant import Assistant
+from core.providers import ProviderPool
+from core.router import Router
+from gui.dialogs import ActionLogDialog, ApprovalDialog, RecordDialog, SettingsDialog
+from gui.theme import C, STYLE, icon
+from gui.workers import ChatWorker, FunctionWorker, StatusWorker
+
+SUGGESTIONS = ["How much RAM is free?", "Open VS Code", "Latest AI news", "Explain CUDA shared memory",
+               "Send a voice message", "What's scheduled?"]
+HOTKEY_VOICE, HOTKEY_SHOW = 1, 2
 from memory.database import Database
-from core.agent import Agent
-from gui.workers import ChatWorker, SpeechWorker, SpeechOutputWorker
-from voice.audio_manager import AudioManager
-from voice.speech_to_text import SpeechToText
 
-ROOT=Path(__file__).resolve().parent.parent
-COLORS={"bg":"#0B0E13","panel":"#11151C","line":"#232A35","text":"#E8EAEE","muted":"#A3ACBA","accent":"#E5484D","blue":"#5AA9FF","gold":"#F2C14E"}
 
-def icon(name,color="#E8EAEE"):
-    path=ROOT/"ultron-icons"/"ultron-icons"/"ui"/(name+".svg")
-    if not path.exists():return QIcon()
-    from PySide6.QtGui import QPixmap
-    from PySide6.QtSvg import QSvgRenderer
-    from PySide6.QtCore import QByteArray
-    data=path.read_text(encoding="utf-8").replace("currentColor",color).encode()
-    pix=QPixmap(24,24);pix.fill(Qt.GlobalColor.transparent);renderer=QSvgRenderer(QByteArray(data));from PySide6.QtGui import QPainter
-    painter=QPainter(pix);renderer.render(painter);painter.end();return QIcon(pix)
+def markdown_html(text: str) -> str:
+    doc = QTextDocument()
+    doc.setMarkdown(text)
+    body = re.search(r"<body[^>]*>(.*)</body>", doc.toHtml(), re.S)
+    return body.group(1) if body else html.escape(text)
 
-class ApprovalDialog(QDialog):
-    def __init__(self,description,parent=None):
-        super().__init__(parent);self.setWindowTitle("ULTRON · Permission request");self.setMinimumWidth(470)
-        lay=QVBoxLayout(self);title=QLabel("This action needs your approval");title.setStyleSheet("font-size:19px;font-weight:650")
-        text=QLabel(description);text.setWordWrap(True);text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(title);lay.addWidget(QLabel("Review the exact action and resolved arguments."));lay.addWidget(text)
-        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel);self.approve=buttons.addButton("Approve",QDialogButtonBox.ButtonRole.AcceptRole);self.approve.setObjectName("primary")
-        buttons.accepted.connect(self.accept);buttons.rejected.connect(self.reject);lay.addWidget(buttons)
 
 class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__();self.setWindowTitle(APP_NAME);self.resize(1440,900);self.setMinimumSize(1000,650)
-        appicon=ROOT/"ultron-icons"/"ultron-icons"/"app"/"ultron.ico"
-        if appicon.exists():self.setWindowIcon(QIcon(str(appicon)))
-        self.db=Database(DATABASE);self.pool=QThreadPool(self);self.pool.setMaxThreadCount(4)
-        self.agent=Agent(self.db,model=self.db.get_setting("model",MODEL),host=self.db.get_setting("ollama_host",OLLAMA_HOST))
-        self.active_workers={};self.unread_conversations=set();self.drafts={};self.toast_conversation_id=None
-        self.audio_manager=AudioManager();self.whisper_model_path=self.db.get_setting("whisper_model_path","base")
-        self.speech_to_text=SpeechToText(model_name=self.whisper_model_path);self.voice_busy=False;self.voice_recording=False
-        self.pending_transcript=None;self.voice_error=None;self.speak_after_voice=False
-        self.piper_voice_path=self.db.get_setting("piper_voice_model","")
-        conversations=self.db.conversations();self.conversation_id=conversations[0]["id"] if conversations else self.db.new_conversation()
-        self.low_memory=self.db.get_setting("low_memory","false")=="true";self.build();self.load_history();self.refresh_conversations();self.timer=QTimer(self);self.timer.timeout.connect(self.refresh_status);self.timer.start(5000);self.refresh_status()
-    def build(self):
-        self.setStyleSheet(f"""
-        QMainWindow,QWidget{{background:{COLORS['bg']};color:{COLORS['text']};font-family:'Segoe UI';font-size:14px}}
-        QFrame#top,QFrame#sidebar,QFrame#right{{background:{COLORS['panel']}}} QFrame#top{{border-bottom:1px solid {COLORS['line']}}}
-        QFrame#sidebar{{border-right:1px solid {COLORS['line']}}} QFrame#right{{border-left:1px solid {COLORS['line']}}}
-        QPushButton{{background:#191f29;border:1px solid {COLORS['line']};border-radius:10px;padding:10px 14px}} QPushButton:hover{{background:#222a36}}
-        QPushButton#primary{{background:#C62F33;border:0;font-weight:600}} QPushButton#primary:hover{{background:{COLORS['accent']}}}
-        QPushButton#new{{background:#201719;border:1px solid #3a2529;color:#ffdfe0;font-size:15px;font-weight:600}}
-        QLineEdit,QTextEdit,QComboBox{{background:#11151c;border:1px solid {COLORS['line']};border-radius:10px;padding:10px;color:{COLORS['text']}}}
-        QListWidget{{background:transparent;border:0;outline:0}} QListWidget::item{{padding:12px;border-radius:8px}} QListWidget::item:selected{{background:#1b222d}}
-        QTextBrowser{{background:transparent;border:0;padding:8px}} QProgressBar{{background:#202630;border:0;border-radius:4px;height:8px;text-align:center}} QProgressBar::chunk{{background:#5AA9FF;border-radius:4px}}
-        QHeaderView::section,QTableWidget{{background:{COLORS['panel']};border:1px solid {COLORS['line']};padding:7px}} QTableWidget{{gridline-color:{COLORS['line']}}}
-        """)
-        root=QWidget();self.setCentralWidget(root);outer=QVBoxLayout(root);outer.setContentsMargins(0,0,0,0);outer.setSpacing(0)
-        top=QFrame(objectName="top");top.setFixedHeight(66);tl=QHBoxLayout(top);tl.setContentsMargins(22,8,22,8)
-        brand=QLabel("◉  ULTRON");brand.setStyleSheet("font-size:21px;font-weight:750;letter-spacing:2px");tl.addWidget(brand)
-        self.online=QLabel("●  Checking local AI…");self.online.setStyleSheet("color:#8ebfff;background:#172231;border:1px solid #283d56;border-radius:16px;padding:8px 12px");tl.addWidget(self.online);tl.addStretch()
-        self.history_button=QPushButton("History");self.history_button.setIcon(icon("history"));self.history_button.clicked.connect(self.show_history);tl.addWidget(self.history_button)
-        settings=QPushButton("Settings");settings.setIcon(icon("settings"));settings.clicked.connect(self.show_settings);tl.addWidget(settings);outer.addWidget(top)
-        body=QHBoxLayout();body.setSpacing(0);outer.addLayout(body,1)
-        side=QFrame(objectName="sidebar");side.setFixedWidth(290);sl=QVBoxLayout(side);sl.setContentsMargins(14,18,14,14)
-        self.new_chat_button=QPushButton("＋   New chat",objectName="new");self.new_chat_button.clicked.connect(self.new_chat);sl.addWidget(self.new_chat_button);self.search_chats=QLineEdit();self.search_chats.setPlaceholderText("⌕   Search chats");self.search_chats.textChanged.connect(self.filter_chats);sl.addWidget(self.search_chats)
-        lbl=QLabel("YOUR CHATS");lbl.setStyleSheet("color:#7e899b;font-weight:bold;letter-spacing:1px;margin-top:15px");sl.addWidget(lbl)
-        self.chat_list=QListWidget();self.chat_list.itemClicked.connect(self.select_chat);sl.addWidget(self.chat_list,1)
+    def __init__(self, db: Database | None = None, providers_config: dict | None = None):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1360, 860)
+        self.setMinimumSize(1000, 640)
+        if (ASSETS / "ultron.ico").exists():
+            self.setWindowIcon(QIcon(str(ASSETS / "ultron.ico")))
+        self.db = db or Database(DATABASE)
+        self.providers_config = providers_config or load_providers()
+        self.pool = ProviderPool(self.providers_config)
+        self.router = Router()
+        self.assistant = Assistant(self.db, self.router, self.pool)
+        self.threads = QThreadPool(self)
+        self.threads.setMaxThreadCount(4)
+        self._keep: set = set()
+        self.busy_cid: str | None = None
+        self.unread: set[str] = set()
+        self.status_running = False
+        self.recorder = None
+        self.stt = None
+        self.speak_next_reply = False
+        self.apply_settings()
+
+        convs = self.db.conversations()
+        self.cid = convs[0]["id"] if convs else self.db.new_conversation()
+        self.setStyleSheet(STYLE)
+        self._build()
+        self.refresh_chats()
+        self.render()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll_status)
+        self.timer.start(5000)
+        self.poll_status()
+        QTimer.singleShot(300, self.load_router_model)
+        self.voice_window = None
+        self._reply_callback = None
+        self._quitting = False
+        self._told_background = False
+        self.tray = QSystemTrayIcon(self.windowIcon(), self) if QSystemTrayIcon.isSystemTrayAvailable() else None
+        if self.tray:
+            self.tray.setToolTip("ULTRON · running")
+            menu = QMenu()
+            for label, slot in (("Open ULTRON", self.show_window), ("Voice mode  (Ctrl+Alt+Space)", self.open_voice_mode),
+                                ("Quit ULTRON", self.quit_app)):
+                action = QAction(label, menu)
+                action.triggered.connect(slot)
+                menu.addAction(action)
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(lambda reason: self.show_window()
+                                        if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+            self.tray.show()
+        self.register_hotkeys()
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.timeout.connect(self.run_due_tasks)
+        self.schedule_timer.start(20000)
+        QTimer.singleShot(1500, self.run_due_tasks)
+
+
+    def apply_settings(self):
+        self.pool.local_model = self.db.get("local_model", LOCAL_MODEL) or LOCAL_MODEL
+        self.pool.ollama_url = self.db.get("ollama_url", OLLAMA_URL) or OLLAMA_URL
+        self.pool.model_overrides = {k: v for k, v in (("groq", self.db.get("groq_model", "")),
+                                                       ("gemini", self.db.get("gemini_model", ""))) if v}
+        self.low_memory = bool(self.db.get("low_memory", False))
+
+
+    def _build(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QFrame(objectName="header")
+        header.setFixedHeight(56)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(18, 6, 18, 6)
+        logo = QLabel()
+        if (ASSETS / "ultron.svg").exists():
+            logo.setPixmap(QIcon(str(ASSETS / "ultron.svg")).pixmap(28, 28))
+        hl.addWidget(logo)
+        name = QLabel("ULTRON")
+        name.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        name.setStyleSheet("letter-spacing: 3px;")
+        hl.addWidget(name)
+        self.pill = QLabel("Checking local AI…")
+        self.pill.setStyleSheet(self._pill_style(C["blue"]))
+        hl.addWidget(self.pill)
+        hl.addStretch()
+        voice_btn = QPushButton(" Voice mode", objectName="primary")
+        voice_btn.setIcon(icon("mic", "#FFFFFF"))
+        voice_btn.setToolTip("Talk hands-free (Ctrl+Alt+Space from anywhere)")
+        voice_btn.clicked.connect(self.open_voice_mode)
+        hl.addWidget(voice_btn)
+        log_btn = QPushButton(" Action log")
+        log_btn.setIcon(icon("action-log"))
+        log_btn.clicked.connect(lambda: ActionLogDialog(self.db, self).exec())
+        settings_btn = QPushButton(" Settings")
+        settings_btn.setIcon(icon("settings"))
+        settings_btn.clicked.connect(self.open_settings)
+        hl.addWidget(log_btn)
+        hl.addWidget(settings_btn)
+        outer.addWidget(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        outer.addLayout(body, 1)
+
+
+        side = QFrame(objectName="sidebar")
+        side.setFixedWidth(260)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(12, 14, 12, 12)
+        new_btn = QPushButton(" New chat", objectName="newchat")
+        new_btn.setIcon(icon("new-chat", "#FFD9DA"))
+        new_btn.clicked.connect(self.new_chat)
+        sl.addWidget(new_btn)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search chats")
+        self.search.textChanged.connect(self.refresh_chats)
+        sl.addWidget(self.search)
+        lab = QLabel("CHATS", objectName="section")
+        sl.addWidget(lab)
+        self.chat_list = QListWidget()
+        self.chat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.chat_list.itemClicked.connect(lambda item: self.open_chat(item.data(Qt.ItemDataRole.UserRole)))
+        sl.addWidget(self.chat_list, 1)
+        delete = QPushButton(" Delete this chat")
+        delete.setIcon(icon("delete", C["muted"]))
+        delete.clicked.connect(self.delete_chat)
+        sl.addWidget(delete)
         body.addWidget(side)
-        center=QWidget();cl=QVBoxLayout(center);cl.setContentsMargins(30,20,30,16)
-        self.chat=QTextBrowser();self.chat.setOpenExternalLinks(True);cl.addWidget(self.chat,1)
-        compose=QHBoxLayout();self.input=QTextEdit();self.input.setPlaceholderText("Type a message…   ·   Enter to send");self.input.setFixedHeight(76);self.input.installEventFilter(self);compose.addWidget(self.input,1)
-        self.mic_button=QPushButton();self.mic_button.setIcon(icon("mic"));self.mic_button.setToolTip("Hold to talk. Whisper base must be available locally.");self.mic_button.pressed.connect(self.start_voice_recording);self.mic_button.released.connect(self.stop_voice_recording);compose.addWidget(self.mic_button)
-        self.send_button=QPushButton("Send ➤",objectName="primary");self.send_button.clicked.connect(self.send_message);compose.addWidget(self.send_button);cl.addLayout(compose)
-        self.task=QLabel("Ready · Enter to send");self.task.setStyleSheet("color:#8792a4;padding:4px");cl.addWidget(self.task);body.addWidget(center,1)
-        right=QFrame(objectName="right");right.setFixedWidth(300);rl=QVBoxLayout(right);rl.setContentsMargins(18,20,18,18)
-        hdr=QLabel("SYSTEM");hdr.setStyleSheet("color:#7e899b;font-weight:bold;letter-spacing:1px");rl.addWidget(hdr)
-        self.cpu_card,self.cpu_bar=self.metric_card("CPU");rl.addWidget(self.cpu_card)
-        self.ram_card,self.ram_bar=self.metric_card("RAM");rl.addWidget(self.ram_card)
-        self.model_card=QLabel(f"Model\n{MODEL}\n\nVoice  Off");self.model_card.setWordWrap(True);self.model_card.setStyleSheet("background:#141922;border:1px solid #252d39;border-radius:12px;padding:14px;line-height:1.5");rl.addWidget(self.model_card)
-        taskhdr=QLabel("TASK");taskhdr.setStyleSheet("color:#7e899b;font-weight:bold;letter-spacing:1px;margin-top:12px");rl.addWidget(taskhdr)
-        self.task_card=QLabel("Idle\nWaiting for your next command");self.task_card.setWordWrap(True);self.task_card.setStyleSheet("background:#141922;border:1px solid #252d39;border-radius:12px;padding:14px;color:#b8c0cc");rl.addWidget(self.task_card);rl.addStretch()
-        log=QPushButton("☷  View action log");log.setStyleSheet("color:#72b6ff;text-decoration:underline;background:transparent;border:0;text-align:left");log.clicked.connect(self.show_logs);rl.addWidget(log);body.addWidget(right)
-        self.toast=QFrame(root);self.toast.setObjectName("toast");self.toast.setStyleSheet("QFrame#toast{background:#182536;border:1px solid #365779;border-radius:12px}")
-        toast_layout=QHBoxLayout(self.toast);toast_layout.setContentsMargins(14,8,10,8)
-        self.toast_text=QLabel("A reply is ready");toast_layout.addWidget(self.toast_text)
-        self.toast_open=QPushButton("Open chat");self.toast_open.clicked.connect(self.open_toast_chat);toast_layout.addWidget(self.toast_open)
-        self.toast.hide();self.toast_timer=QTimer(self);self.toast_timer.setSingleShot(True);self.toast_timer.timeout.connect(self.toast.hide)
-    def metric_card(self,title):
-        card=QFrame();v=QVBoxLayout(card);v.setContentsMargins(12,10,12,12);line=QHBoxLayout();line.addWidget(QLabel(title));val=QLabel("—");val.setObjectName("value");line.addStretch();line.addWidget(val);v.addLayout(line);bar=QProgressBar();bar.setTextVisible(False);v.addWidget(bar);card.value_label=val;return card,bar
-    def load_history(self):
-        self.chat.clear()
-        for m in self.db.messages(self.conversation_id):self.append_message(m["role"],m["content"])
-    def append_message(self,role,text):
-        who="You" if role=="user" else "ULTRON"; color="#9ca9bb" if role=="user" else "#E8EAEE"
-        link_pattern=re.compile(r"https?://[^\s<>\"']+",re.IGNORECASE)
-        chunks=[];position=0
-        for match in link_pattern.finditer(text):
-            url=match.group(0);trimmed=url.rstrip(".,!?;:)")
-            suffix=url[len(trimmed):]
-            chunks.append(html.escape(text[position:match.start()]).replace("\n","<br>"))
-            escaped=html.escape(trimmed,quote=True)
-            chunks.append(f'<a href="{escaped}" style="color:#72b6ff">{html.escape(trimmed)}</a>{html.escape(suffix)}')
-            position=match.end()
-        chunks.append(html.escape(text[position:]).replace("\n","<br>"))
-        safe="".join(chunks)
-        self.chat.append(f'<p style="margin:12px 0 4px;color:#8f9caf;font-size:12px;font-weight:bold">{who}</p><div style="color:{color};line-height:1.55;margin-bottom:20px">{safe}</div>')
-    def refresh_conversations(self):
+
+
+        center = QWidget()
+        cl = QVBoxLayout(center)
+        cl.setContentsMargins(28, 14, 28, 14)
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        self.view.document().setDefaultStyleSheet(f"a {{ color: #7DBBFF; }} code {{ color: {C['amber']}; }}")
+        cl.addWidget(self.view, 1)
+        self.privacy = QLabel()
+        self.privacy.setObjectName("muted")
+        cl.addWidget(self.privacy)
+        self.chips = QWidget()
+        from PySide6.QtWidgets import QGridLayout
+        chip_grid = QGridLayout(self.chips)
+        chip_grid.setContentsMargins(0, 0, 0, 6)
+        chip_grid.setHorizontalSpacing(6)
+        chip_grid.setVerticalSpacing(6)
+        for i, text in enumerate(SUGGESTIONS):
+            chip = QPushButton(text)
+            chip.setStyleSheet(f"background: {C['card']}; border: 1px solid {C['line']}; border-radius: 14px; "
+                               f"padding: 6px 12px; color: {C['muted']}; font-size: 12px;")
+            chip.setToolTip(text)
+            chip.clicked.connect(lambda _c=False, t=text: (self.input.setPlainText(t), self.input.setFocus()))
+            chip_grid.addWidget(chip, i // 3, i % 3)
+        cl.addWidget(self.chips)
+        composer = QFrame(objectName="card")
+        cr = QHBoxLayout(composer)
+        cr.setContentsMargins(8, 8, 8, 8)
+        self.input = QTextEdit()
+        self.input.setPlaceholderText("Message ULTRON…  (Enter to send, Shift+Enter for a new line, /local to keep it on this PC)")
+        self.input.setFixedHeight(64)
+        self.input.setStyleSheet("border: 0; background: transparent;")
+        self.input.installEventFilter(self)
+        cr.addWidget(self.input, 1)
+        self.mic = QPushButton()
+        self.mic.setIcon(icon("mic"))
+        self.mic.setFixedSize(44, 44)
+        self.mic.setToolTip("Hold to talk (speech is transcribed on this PC)")
+        self.mic.setAccessibleName("Hold to talk")
+        self.mic.pressed.connect(self.start_recording)
+        self.mic.released.connect(self.stop_recording)
+        cr.addWidget(self.mic)
+        self.send_btn = QPushButton(objectName="primary")
+        self.send_btn.setIcon(icon("send", "#FFFFFF"))
+        self.send_btn.setFixedSize(44, 44)
+        self.send_btn.setAccessibleName("Send")
+        self.send_btn.clicked.connect(self.send)
+        cr.addWidget(self.send_btn)
+        cl.addWidget(composer)
+        below = QHBoxLayout()
+        self.task_line = QLabel("Ready")
+        self.task_line.setObjectName("muted")
+        below.addWidget(self.task_line, 1)
+        self.cloud_box = QCheckBox("Allow cloud AI for general && web questions")
+        self.cloud_box.setChecked(bool(self.db.get("cloud_enabled", True)))
+        self.cloud_box.toggled.connect(lambda on: (self.db.set("cloud_enabled", on), self.update_privacy()))
+        below.addWidget(self.cloud_box)
+        cl.addLayout(below)
+        body.addWidget(center, 1)
+
+
+        right = QFrame(objectName="right")
+        right.setFixedWidth(280)
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(16, 16, 16, 16)
+        rl.setSpacing(10)
+        rl.addWidget(QLabel("SYSTEM", objectName="section"))
+        self.cpu_value, self.cpu_bar = self._metric(rl, "CPU")
+        self.ram_value, self.ram_bar = self._metric(rl, "RAM")
+        rl.addWidget(QLabel("AI", objectName="section"))
+        ai = QFrame(objectName="card")
+        al = QVBoxLayout(ai)
+        al.setContentsMargins(12, 10, 12, 10)
+        self.ai_label = QLabel("…")
+        self.ai_label.setWordWrap(True)
+        self.ai_label.setTextFormat(Qt.TextFormat.RichText)
+        al.addWidget(self.ai_label)
+        rl.addWidget(ai)
+        rl.addWidget(QLabel("TASK", objectName="section"))
+        task = QFrame(objectName="card")
+        tl = QVBoxLayout(task)
+        tl.setContentsMargins(12, 10, 12, 10)
+        self.task_card = QLabel("Waiting for your next command")
+        self.task_card.setWordWrap(True)
+        tl.addWidget(self.task_card)
+        rl.addWidget(task)
+        rl.addWidget(QLabel("SCHEDULED", objectName="section"))
+        sched = QFrame(objectName="card")
+        sc = QVBoxLayout(sched)
+        sc.setContentsMargins(12, 10, 12, 10)
+        self.schedule_label = QLabel("Nothing scheduled")
+        self.schedule_label.setWordWrap(True)
+        self.schedule_label.setObjectName("muted")
+        sc.addWidget(self.schedule_label)
+        rl.addWidget(sched)
+        rl.addStretch()
+        body.addWidget(right)
+        self.routing_state = "Keyword routing (smart routing loading…)" if self.db.get("smart_routing", True) \
+            else "Keyword routing"
+        self.ollama_state = "checking…"
+        self.update_ai_card()
+
+    def _metric(self, layout, title):
+        card = QFrame(objectName="card")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(12, 10, 12, 10)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(title))
+        row.addStretch()
+        value = QLabel("—")
+        row.addWidget(value)
+        v.addLayout(row)
+        bar = QProgressBar()
+        bar.setTextVisible(False)
+        v.addWidget(bar)
+        layout.addWidget(card)
+        return value, bar
+
+    @staticmethod
+    def _pill_style(color):
+        return (f"color: {color}; border: 1px solid {color}; border-radius: 12px; padding: 4px 10px; "
+                "font-size: 12px; margin-left: 10px;")
+
+
+    def refresh_chats(self):
+        text = self.search.text().strip() if hasattr(self, "search") else ""
+        convs = self.db.search_conversations(text) if text else self.db.conversations()
         self.chat_list.clear()
-        for c in self.db.conversations():
-            unread=c["id"] in self.unread_conversations
-            item=QListWidgetItem(("●  " if unread else "")+c["title"]);item.setData(Qt.ItemDataRole.UserRole,c["id"])
-            item.setForeground(QColor(COLORS["blue"] if unread else COLORS["text"]))
-            if unread:item.setToolTip("A reply is ready in this chat")
+        for c in convs:
+            title = ("● " if c["id"] in self.unread else "") + c["title"]
+            item = QListWidgetItem(title)
+            item.setData(Qt.ItemDataRole.UserRole, c["id"])
+            if c["local_only"]:
+                item.setToolTip("This chat used device data. Cloud requests may include ULTRON's local replies, "
+                                "but not your device prompts or raw tool results. Local replies may contain "
+                                "summaries of device information.")
             self.chat_list.addItem(item)
-            if c["id"]==self.conversation_id:self.chat_list.setCurrentItem(item)
-    def filter_chats(self,text):
-        for i in range(self.chat_list.count()):self.chat_list.item(i).setHidden(text.casefold() not in self.chat_list.item(i).text().casefold())
-    def select_chat(self,item):
-        self.drafts[self.conversation_id]=self.input.toPlainText()
-        self.activate_conversation(item.data(Qt.ItemDataRole.UserRole))
-    def activate_conversation(self,conversation_id):
-        self.conversation_id=conversation_id;self.unread_conversations.discard(conversation_id)
-        self.load_history();self.input.setPlainText(self.drafts.get(conversation_id,""));self.refresh_conversations()
-        self.task.setText("Generating a reply…" if conversation_id in self.active_workers else "Ready · Enter to send")
-        if self.toast_conversation_id==conversation_id:self.toast.hide();self.toast_timer.stop()
+            if c["id"] == self.cid:
+                self.chat_list.setCurrentItem(item)
+
+    def open_chat(self, cid):
+        self.cid = cid
+        self.unread.discard(cid)
+        self.refresh_chats()
+        self.render()
+
     def new_chat(self):
-        self.drafts[self.conversation_id]=self.input.toPlainText()
-        self.conversation_id=self.db.new_conversation();self.chat.clear();self.input.clear();self.refresh_conversations();self.input.setFocus()
-    def eventFilter(self,obj,event):
-        if obj is self.input and event.type()==QEvent.Type.KeyPress and event.key()==Qt.Key.Key_Return and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self.send_message();return True
-        return super().eventFilter(obj,event)
-    def send_message(self):
-        text=self.input.toPlainText().strip()
-        conversation_id=self.conversation_id
-        if not text or self.voice_busy:return
-        if conversation_id in self.active_workers:
-            self.task.setText("This chat is still generating. Switch to another chat to continue.");return
-        self.input.clear();self.drafts[conversation_id]="";self.append_message("user",text);self.refresh_conversations();self.task.setText("ULTRON is thinking…");self.task_card.setText("Processing your request…")
-        agent=Agent(self.db,model=self.db.get_setting("model",MODEL),host=self.db.get_setting("ollama_host",OLLAMA_HOST))
-        worker=ChatWorker(agent,conversation_id,text);self.active_workers[conversation_id]=worker
-        worker.signals.result.connect(self.receive_answer);worker.signals.error.connect(self.receive_error);worker.signals.finished.connect(self.finished);worker.signals.status.connect(self.update_status);worker.signals.approval_requested.connect(self.request_approval);self.pool.start(worker)
-    def request_approval(self,name,description,handshake):
-        event,state=handshake;dialog=ApprovalDialog(description,self);state["approved"]=dialog.exec()==QDialog.DialogCode.Accepted;event.set()
-    def receive_answer(self,conversation_id,text):
-        if conversation_id==self.conversation_id:
-            self.load_history();self.task_card.setText("Done\nWaiting for your next command")
-            if self.speak_after_voice:self.speak_after_voice=False;self.speak_response(text)
-        else:self.speak_after_voice=False;self.mark_reply_ready(conversation_id)
-        self.refresh_conversations()
-    def receive_error(self,conversation_id,text):
-        self.speak_after_voice=False
-        self.db.add_message(conversation_id,"assistant",f"I couldn't complete that: {text}")
-        if conversation_id==self.conversation_id:
-            self.load_history();self.task_card.setText("Failed\nSee the error above")
-        else:self.mark_reply_ready(conversation_id)
-        self.refresh_conversations()
-    def finished(self,conversation_id):
-        self.active_workers.pop(conversation_id,None)
-        if conversation_id==self.conversation_id:self.task.setText("Ready · Enter to send")
-        self.refresh_conversations()
-    def update_status(self,conversation_id,text):
-        if conversation_id==self.conversation_id:self.task.setText(text);self.task_card.setText(text)
-    def mark_reply_ready(self,conversation_id):
-        title=next((c["title"] for c in self.db.conversations() if c["id"]==conversation_id),"another chat")
-        self.unread_conversations.add(conversation_id);self.toast_conversation_id=conversation_id
-        self.toast_text.setText(f"Reply ready in {title}");self.toast.adjustSize()
-        root=self.centralWidget();self.toast.move(root.width()-self.toast.width()-22,root.height()-self.toast.height()-24);self.toast.show();self.toast.raise_();self.toast_timer.start(7000)
-    def open_toast_chat(self):
-        if self.toast_conversation_id:self.activate_conversation(self.toast_conversation_id)
+        self.cid = self.db.new_conversation()
+        self.refresh_chats()
+        self.render()
+        self.input.setFocus()
 
-    def _set_voice_controls(self,enabled):
-        self.chat_list.setEnabled(enabled);self.new_chat_button.setEnabled(enabled);self.history_button.setEnabled(enabled)
-        self.send_button.setEnabled(enabled);self.input.setEnabled(enabled)
-        self.mic_button.setEnabled(enabled and not self.low_memory)
+    def delete_chat(self):
+        if self.busy_cid == self.cid:
+            return
+        if QMessageBox.question(self, "Delete chat", "Delete this chat and its messages?") != QMessageBox.StandardButton.Yes:
+            return
+        self.db.delete_conversation(self.cid)
+        convs = self.db.conversations()
+        self.cid = convs[0]["id"] if convs else self.db.new_conversation()
+        self.refresh_chats()
+        self.render()
 
-    def start_voice_recording(self):
-        if self.low_memory:
-            self.task.setText("Voice is disabled in low-memory mode.");return
-        if not self.speech_to_text.model_available_locally():
-            self.task.setText("Whisper model missing · select a local model folder in Settings.");return
-        if self.voice_busy or self.active_workers:
-            self.task.setText("Wait for current AI work to finish before recording.");return
+
+    def render(self, pending: str | None = None):
+        parts = ["<div style='font-size:14px'>"]
+        rows = [r for r in self.db.messages(self.cid) if r["role"] in ("user", "assistant")]
+        if not rows and not pending:
+            parts.append(f"<p style='color:{C['muted']}; margin-top:40px' align='center'>Good to see you. "
+                         "What would you like me to do?</p>")
+        for r in rows:
+            parts.append(self._bubble(r["role"], r["content"], r.get("provider", ""), r.get("route", "")))
+        if pending:
+            parts.append(self._bubble("user", pending, "", ""))
+            parts.append(f"<p style='color:{C['dim']}'>ULTRON is working…</p>")
+        parts.append("</div>")
+        self.view.setHtml("".join(parts))
+        if hasattr(self, "chips"):
+            self.chips.setVisible(not rows and not pending)
+        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        self.update_privacy()
+
+    def _bubble(self, role, content, provider, route):
+        if role == "user":
+            text = html.escape(content).replace("\n", "<br>")
+            return ("<table width='100%' cellspacing='0' cellpadding='0' style='margin:10px 0'><tr>"
+                    "<td width='22%'></td>"
+                    f"<td bgcolor='{C['user']}' style='padding:10px 14px'>{text}</td></tr></table>")
+        if provider.startswith("Local"):
+            tag = f"<span style='color:{C['muted']}'>{html.escape(provider)} · stayed on this PC</span>"
+        elif provider and provider != "None":
+            tag = f"<span style='color:{C['blue']}'>Cloud · {html.escape(provider)}</span>"
+        else:
+            tag = f"<span style='color:{C['orange']}'>No provider answered</span>"
+        return (f"<p style='margin:14px 0 2px; font-size:12px'><b style='color:{C['accent']}'>ULTRON</b>"
+                f"&nbsp;&nbsp;{tag}</p><div style='color:{C['text']}'>{markdown_html(content)}</div>")
+
+    def update_privacy(self):
+        if not self.cloud_box.isChecked():
+            text = "Cloud AI is off. Everything stays on this PC."
+        elif self.db.is_local_only(self.cid):
+            text = ("This chat used device data. Local requests and raw tool results stay on this PC; later cloud "
+                    "requests may include the local model's final reply, which may summarize device information.")
+        else:
+            text = ("Device prompts and raw tool results stay on this PC. General and web questions may use Groq or "
+                    "Gemini and can include the local model's earlier final replies.")
+        self.privacy.setText(text)
+
+
+    def eventFilter(self, obj, event):
+        if obj is self.input and event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.send()
+            return True
+        return super().eventFilter(obj, event)
+
+    def send(self):
+        text = self.input.toPlainText().strip()
+        if text and self.submit(text):
+            self.input.clear()
+
+    def submit(self, text: str, on_reply=None) -> bool:
+        """Runs a message through ULTRON. on_reply(text) is called with the answer (used by voice mode)."""
+        if self.busy_cid:
+            self.set_task("Still working on the previous request…")
+            if on_reply:
+                on_reply("I'm still working on the previous request.")
+            return False
+        self._reply_callback = on_reply
+        self.busy_cid = self.cid
+        self.send_btn.setEnabled(False)
+        self.render(pending=text)
+        self.set_task("Thinking…")
+        worker = ChatWorker(self.assistant, self.cid, text)
+        worker.signals.status.connect(lambda cid, m: self.set_task(m) if cid == self.busy_cid else None)
+        worker.signals.approval.connect(self.ask_approval)
+        worker.signals.record.connect(self.ask_recording)
+        worker.signals.reply.connect(self.on_reply)
+        worker.signals.error.connect(self.on_error)
+        worker.signals.done.connect(lambda _cid, w=worker: self._finish(w))
+        self._keep.add(worker)
+        self.threads.start(worker)
+        return True
+
+    def ask_approval(self, request, handshake):
+        event, holder = handshake
         try:
-            self.pending_transcript=None;self.voice_error=None
-            self.audio_manager.start_recording();self.voice_recording=True;self.voice_busy=True;self._set_voice_controls(False)
-            self.task.setText("Listening… release the microphone button when finished.")
-        except Exception as exc:
-            self.voice_recording=False;self.voice_busy=False;self._set_voice_controls(True)
-            self.task.setText(f"Microphone unavailable: {exc}")
+            holder["ok"] = ApprovalDialog(request, self).exec() == QDialog.DialogCode.Accepted
+        finally:
+            event.set()
 
-    def stop_voice_recording(self):
-        if not self.voice_recording:return
-        self.voice_recording=False
-        try:audio=self.audio_manager.stop_recording()
-        except Exception as exc:
-            self.voice_error=str(exc);self._finish_voice_processing();return
-        worker=SpeechWorker(self.speech_to_text,audio);self.pending_transcript=None;self.voice_error=None
-        worker.signals.result.connect(self.receive_transcript);worker.signals.error.connect(self.receive_voice_error);worker.signals.finished.connect(self._finish_voice_processing)
-        self.task.setText("Transcribing speech…");self.pool.start(worker)
-
-    def receive_transcript(self,text):self.pending_transcript=text
-    def receive_voice_error(self,error):self.voice_error=error
-    def _finish_voice_processing(self):
-        self.voice_busy=False;self._set_voice_controls(True)
-        if self.voice_error:
-            self.task.setText(f"Voice input failed: {self.voice_error}");self.task_card.setText("Voice input failed\nType your message or try again.");return
-        if self.pending_transcript:
-            self.input.setPlainText(self.pending_transcript);self.speak_after_voice=True;self.send_message()
-    def speak_response(self,text):
-        if self.low_memory or not self.piper_voice_path:
-            self.task.setText("Reply ready · choose a Piper voice in Settings to hear spoken replies.");return
-        worker=SpeechOutputWorker(self.piper_voice_path,self.audio_manager,text)
-        worker.signals.error.connect(self.receive_speech_error)
-        worker.signals.finished.connect(self.speech_output_finished)
-        self.task.setText("Speaking response…")
-        self.pool.start(worker)
-
-    def receive_speech_error(self,message):self.task.setText(f"Speech output unavailable: {message}")
-    def speech_output_finished(self):
-        if self.task.text().startswith("Speaking") or self.task.text().startswith("Ready"):
-            self.task.setText("Ready · Enter to send")
-    def refresh_status(self):
+    def ask_recording(self, prompt, handshake):
+        event, holder = handshake
         try:
-            import psutil
-            cpu=psutil.cpu_percent(interval=None);mem=psutil.virtual_memory();self.cpu_card.value_label.setText(f"{cpu:.0f}%");self.cpu_bar.setValue(int(cpu));self.ram_card.value_label.setText(f"{mem.used/1024**3:.1f} / {mem.total/1024**3:.1f} GB");self.ram_bar.setValue(int(mem.percent))
-            self.ram_bar.setStyleSheet("QProgressBar::chunk{background:#F2C14E}" if mem.percent>=80 else "")
-        except ImportError:self.cpu_card.value_label.setText("psutil missing");self.ram_card.value_label.setText("psutil missing")
-        try:
-            import ollama
-            data=ollama.Client(host=self.db.get_setting("ollama_host",OLLAMA_HOST)).list();models=getattr(data,"models",None)
-            if models is None:models=data.get("models",[])
-            tags=[getattr(m,"model",None) or getattr(m,"name",None) or (m.get("name",m.get("model","")) if isinstance(m,dict) else "") for m in models]
-            self.online.setText("●  Local AI online" if tags else "●  Ollama online · no models")
-            selected=self.db.get_setting("model",MODEL);found=next((t for t in tags if t==selected or t.split(":")[0]==selected.split(":")[0]),None)
-            voice_state="Off · low-memory mode" if self.low_memory else ("Ready" if self.speech_to_text.model_available_locally() else "Whisper model missing")
-            if not self.low_memory and self.piper_voice_path:voice_state += " · Piper voice selected"
-            elif not self.low_memory:voice_state += " · choose Piper voice in Settings for spoken replies"
-            self.model_card.setText(f"Model\n{selected}\n\nState  {'Available' if found else 'Not downloaded'}\nVoice  {voice_state}")
-        except Exception:self.online.setText("●  Local AI unavailable");self.online.setStyleSheet("color:#ff9a83;background:#241916;border:1px solid #50342d;border-radius:16px;padding:8px 12px")
-    def show_history(self):
-        dlg=QDialog(self);dlg.setWindowTitle("Conversation history");dlg.resize(520,460);lay=QVBoxLayout(dlg);lst=QListWidget()
-        for c in self.db.conversations():it=QListWidgetItem(c["title"]);it.setData(Qt.ItemDataRole.UserRole,c["id"]);lst.addItem(it)
-        lay.addWidget(lst);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Close);buttons.rejected.connect(dlg.reject);lay.addWidget(buttons)
-        def choose(item):self.activate_conversation(item.data(Qt.ItemDataRole.UserRole));dlg.accept()
-        lst.itemDoubleClicked.connect(choose);dlg.exec()
-    def show_logs(self):
-        dlg=QDialog(self);dlg.setWindowTitle("Action log");dlg.resize(900,520);lay=QVBoxLayout(dlg);table=QTableWidget(0,5);table.setHorizontalHeaderLabels(["Time","Tool","Approval","Status","Result"]);table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        for row in self.db.action_logs():
-            i=table.rowCount();table.insertRow(i)
-            for col,key in enumerate(("created_at","tool","approval","status","result")):table.setItem(i,col,QTableWidgetItem(str(row[key])))
-        lay.addWidget(table);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Close);buttons.rejected.connect(dlg.reject);lay.addWidget(buttons);dlg.exec()
-    def show_settings(self):
-        dlg=QDialog(self);dlg.setWindowTitle("ULTRON settings");dlg.resize(600,560);layout=QVBoxLayout(dlg);form=QFormLayout();layout.addLayout(form)
-        model=QComboBox();model.setEditable(True);model.addItems([MODEL,"llama3.2:latest"]);model.setCurrentText(self.db.get_setting("model",MODEL));host=QLineEdit(self.db.get_setting("ollama_host",OLLAMA_HOST));low=QCheckBox("Low-memory mode (voice disabled)");low.setChecked(self.low_memory)
-        voice_path=QLineEdit(self.db.get_setting("piper_voice_model",""));voice_browse=QPushButton("Browse…")
-        voice_row=QWidget();voice_layout=QHBoxLayout(voice_row);voice_layout.setContentsMargins(0,0,0,0);voice_layout.addWidget(voice_path,1);voice_layout.addWidget(voice_browse)
-        voice_browse.clicked.connect(lambda:voice_path.setText(QFileDialog.getOpenFileName(dlg,"Choose a Piper voice model","","Piper voice models (*.onnx)")[0] or voice_path.text()))
-        whisper_path=QLineEdit(self.whisper_model_path);whisper_browse=QPushButton("Browse…")
-        whisper_row=QWidget();whisper_layout=QHBoxLayout(whisper_row);whisper_layout.setContentsMargins(0,0,0,0);whisper_layout.addWidget(whisper_path,1);whisper_layout.addWidget(whisper_browse)
-        whisper_browse.clicked.connect(lambda:whisper_path.setText(QFileDialog.getExistingDirectory(dlg,"Choose Faster-Whisper model folder",whisper_path.text()) or whisper_path.text()))
-        form.addRow("Ollama model",model);form.addRow("Ollama address",host);form.addRow("Memory",low);form.addRow("Whisper model folder",whisper_row);form.addRow("Piper voice file",voice_row)
-        form.addRow("Voice note",QLabel("Whisper folder must contain model.bin. Leave as 'base' to use the local Hugging Face cache. Piper needs a local .onnx voice and matching .onnx.json file."));form.addRow("Data stored locally",QLabel(str(DATABASE)))
-        roots=QListWidget()
-        for r in ALLOWED_ROOTS:roots.addItem(str(r))
-        layout.addWidget(QLabel("Allowed folders · file tools cannot access other locations"));layout.addWidget(roots)
-        add=QPushButton("Add allowed folder…");layout.addWidget(add)
-        def add_root():
-            path=QFileDialog.getExistingDirectory(dlg,"Choose an allowed folder",str(Path.home()))
-            if path and not any(Path(path).resolve()==Path(roots.item(i).text()).resolve() for i in range(roots.count())):roots.addItem(path)
-        add.clicked.connect(add_root);buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Save|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(dlg.accept);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons)
-        if dlg.exec()==QDialog.DialogCode.Accepted:
-            self.db.set_setting("model",model.currentText().strip());self.db.set_setting("ollama_host",host.text().strip());self.db.set_setting("low_memory",str(low.isChecked()).lower());self.low_memory=low.isChecked()
-            self.whisper_model_path=whisper_path.text().strip() or "base";self.db.set_setting("whisper_model_path",self.whisper_model_path)
-            self.speech_to_text=SpeechToText(model_name=self.whisper_model_path)
-            self.piper_voice_path=voice_path.text().strip();self.db.set_setting("piper_voice_model",self.piper_voice_path)
-            from security.path_security import PathSecurity
+            dialog = RecordDialog(prompt, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                holder["audio"] = dialog.result_audio
+        finally:
+            event.set()
+
+
+    def run_due_tasks(self):
+        from datetime import datetime
+
+        from tools.whatsapp import WhatsAppTools
+        scheduler = self.assistant.scheduler
+        for task in scheduler.due():
+            payload = json.loads(task["payload"])
+            due = datetime.fromisoformat(task["run_at"])
+            late = (datetime.now() - due).total_seconds() > 180
             try:
-                allowed=[roots.item(i).text() for i in range(roots.count())]
-                PathSecurity(allowed);self.db.set_setting("allowed_roots",json.dumps(allowed))
-                self.agent.registry.fs.security=PathSecurity(allowed)
-            except Exception as exc:QMessageBox.warning(self,"Invalid folder",str(exc))
-            self.agent.provider.model=self.db.get_setting("model",MODEL);self.agent.provider.host=self.db.get_setting("ollama_host",OLLAMA_HOST)
-            self.mic_button.setEnabled(not self.low_memory);self.refresh_status()
+                if task["kind"] != "whatsapp_voice":
+                    raise ValueError(f"Unknown task type {task['kind']}")
+                result = WhatsAppTools(VOICE_NOTES, []).deliver(payload["name"], payload["phone"], payload["file"])
+                text = (f"Reminder: {'(was due at ' + due.strftime('%I:%M %p') + ') ' if late else ''}"
+                        f"Your voice message for **{payload['name']}** is ready. WhatsApp is open on their chat: "
+                        f"{result['next']}")
+                scheduler.finish(task["id"], "done")
+            except Exception as exc:
+                text = f"Reminder: couldn't prepare the scheduled voice message for {payload.get('name', '?')}: {exc}"
+                scheduler.finish(task["id"], "failed")
+            cid = task["conversation_id"] if task["conversation_id"] and self.db.conversation(task["conversation_id"]) \
+                else self.cid
+            self.db.add_message(cid, "assistant", text, route="device", provider="Local · scheduler")
+            if cid == self.cid:
+                self.render()
+            else:
+                self.unread.add(cid)
+                self.refresh_chats()
+            if self.tray:
+                self.tray.showMessage("ULTRON", text.replace("**", "").strip()[:220])
+            self.raise_()
+        self.update_schedule_card()
+
+    def update_schedule_card(self):
+        from tools.whatsapp import describe_task
+        pending = self.assistant.scheduler.pending()
+        self.schedule_label.setText("\n".join(describe_task(t) for t in pending[:4]) or "Nothing scheduled")
+
+    def on_reply(self, cid, reply):
+        if cid == self.cid:
+            self.render()
+        else:
+            self.unread.add(cid)
+        note = f" · {reply.note}" if reply.note else ""
+        self.set_task(f"Done · {reply.provider}{note}")
+        self.update_schedule_card()
+        self.refresh_chats()
+        callback, self._reply_callback = self._reply_callback, None
+        if callback:
+            callback(reply.text)
+            return
+        if self.speak_next_reply:
+            self.speak_next_reply = False
+            self.speak(reply.text)
+
+    def on_error(self, cid, message):
+        self.db.add_message(cid, "assistant", f"Something went wrong: {message}", route="device", provider="Local")
+        if cid == self.cid:
+            self.render()
+        self.set_task("Failed · see the message above")
+        callback, self._reply_callback = self._reply_callback, None
+        if callback:
+            callback(f"Something went wrong: {message}")
+
+    def _finish(self, worker):
+        self._keep.discard(worker)
+        self.busy_cid = None
+        self.send_btn.setEnabled(True)
+        self.refresh_chats()
+
+    def set_task(self, text):
+        self.task_line.setText(text)
+        self.task_card.setText(text)
+
+
+    def poll_status(self):
+        if self.status_running:
+            return
+        self.status_running = True
+        worker = StatusWorker(self.pool.ollama_url, self.pool.local_model)
+        worker.signals.ready.connect(self.on_status)
+        self._keep.add(worker)
+        worker.signals.ready.connect(lambda _i, w=worker: self._keep.discard(w))
+        self.threads.start(worker)
+
+    def on_status(self, info):
+        self.status_running = False
+        if "cpu" in info:
+            self.cpu_value.setText(f"{info['cpu']:.0f}%")
+            self.cpu_bar.setValue(int(info["cpu"]))
+            self.ram_value.setText(f"{info['ram_used']:.1f} / {info['ram_total']:.1f} GB")
+            self.ram_bar.setValue(int(info["ram_percent"]))
+            self.ram_bar.setStyleSheet(f"QProgressBar::chunk {{ background: {C['amber']}; }}"
+                                       if info["ram_percent"] >= 80 else "")
+        online = info.get("ollama") == "online"
+        self.pill.setText("Local AI online" if online else "Local AI offline")
+        self.pill.setStyleSheet(self._pill_style(C["blue"] if online else C["orange"]))
+        self.ollama_state = info.get("model_state", "")
+        self.update_ai_card()
+
+    def update_ai_card(self):
+        lines = [f"<b>Local</b> · {html.escape(self.pool.local_model)}<br>"
+                 f"<span style='color:{C['muted']}'>{html.escape(self.ollama_state)}</span>"]
+        for name, state in self.pool.summary().items():
+            color = C["blue"] if state == "ready" else C["muted"]
+            lines.append(f"<b>{self.pool.label(name)}</b> · <span style='color:{color}'>{html.escape(state)}</span>")
+        lines.append(f"<span style='color:{C['muted']}'>{html.escape(self.routing_state)}</span>")
+        self.ai_label.setText("<br>".join(lines))
+
+    def load_router_model(self):
+        if not self.db.get("smart_routing", True) or self.router.has_embedder:
+            return
+        worker = FunctionWorker(self.router.load_default_embedder, MODEL_CACHE)
+        worker.signals.result.connect(lambda _r: self._routing("Smart routing on (local embedding model)"))
+        worker.signals.error.connect(lambda e: self._routing("Keyword routing (smart routing unavailable)", e))
+        self._keep.add(worker)
+        self.threads.start(worker)
+
+    def _routing(self, text, error=""):
+        self.routing_state = text
+        if error:
+            self.ai_label.setToolTip(error)
+        self.update_ai_card()
+
+    def open_settings(self):
+        if SettingsDialog(self.db, self.providers_config, self).exec() == QDialog.DialogCode.Accepted:
+            self.apply_settings()
+            self.cloud_box.setChecked(bool(self.db.get("cloud_enabled", True)))
+            self.update_ai_card()
+            self.update_privacy()
+            self.load_router_model()
+            self.poll_status()
+            if self.voice_window:
+                self.voice_window.orb.set_palette(self.db.get("orb_palette", "crimson"))
+
+
+    def open_voice_mode(self):
+        from gui.voice_mode import VoiceModeWindow
+        if self.voice_window and self.voice_window.isVisible():
+            self.voice_window.raise_()
+            self.voice_window.activateWindow()
+            return
+        if self.db.messages(self.cid):
+            self.new_chat()
+        self.voice_window = VoiceModeWindow(self.submit, self.threads, self.db,
+                                            palette=self.db.get("orb_palette", "crimson"))
+        self.voice_window.show()
+        self.voice_window.raise_()
+        self.voice_window.activateWindow()
+        self.voice_window.start()
+
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._quitting = True
+        if self.voice_window:
+            self.voice_window.close()
+        self.close()
+        from PySide6.QtWidgets import QApplication
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if not self._quitting and self.tray and self.db.get("run_in_background", True):
+            event.ignore()
+            self.hide()
+            if not self._told_background:
+                self._told_background = True
+                self.tray.showMessage("ULTRON", "Still running in the background. Ctrl+Alt+Space for voice, "
+                                                "Ctrl+Alt+U to open. Right-click the tray icon to quit.")
+            return
+        self.unregister_hotkeys()
+        if self.tray:
+            self.tray.hide()
+        super().closeEvent(event)
+
+    def register_hotkeys(self):
+        """Ctrl+Alt+Space = voice mode, Ctrl+Alt+U = open ULTRON, from any app (Windows only)."""
+        self.hotkeys_ok = False
+        import os
+        if os.name != "nt":
+            return
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        mods = 0x0001 | 0x0002 | 0x4000
+        ok1 = user32.RegisterHotKey(hwnd, HOTKEY_VOICE, mods, 0x20)
+        ok2 = user32.RegisterHotKey(hwnd, HOTKEY_SHOW, mods, ord("U"))
+        self.hotkeys_ok = bool(ok1 and ok2)
+
+    def unregister_hotkeys(self):
+        import os
+        if os.name == "nt":
+            import ctypes
+            for hk in (HOTKEY_VOICE, HOTKEY_SHOW):
+                ctypes.windll.user32.UnregisterHotKey(int(self.winId()), hk)
+
+    def nativeEvent(self, event_type, message):
+        if bytes(event_type) == b"windows_generic_MSG":
+            import ctypes.wintypes
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0312:
+                if msg.wParam == HOTKEY_VOICE:
+                    self.open_voice_mode()
+                elif msg.wParam == HOTKEY_SHOW:
+                    self.show_window()
+                return True, 0
+        return super().nativeEvent(event_type, message)
+
+
+    def start_recording(self):
+        if self.low_memory:
+            self.set_task("Voice is off in low-memory mode (Settings → Voice & data).")
+            return
+        if self.busy_cid:
+            self.set_task("Wait for the current request to finish before talking.")
+            return
+        try:
+            from voice.audio import AudioRecorder
+            self.recorder = self.recorder or AudioRecorder()
+            self.recorder.start()
+            self.mic.setIcon(icon("mic", C["accent"]))
+            self.set_task("Listening… release the button when you're done.")
+        except Exception as exc:
+            self.set_task(f"Microphone unavailable: {exc}")
+
+    def stop_recording(self):
+        if not self.recorder or self.recorder._stream is None:
+            return
+        self.mic.setIcon(icon("mic"))
+        try:
+            audio = self.recorder.stop()
+        except Exception as exc:
+            self.set_task(str(exc))
+            return
+        from voice.stt import SpeechToText
+        self.stt = self.stt or SpeechToText("base")
+
+        def transcribe(a):
+            try:
+                return self.stt.transcribe(a)
+            finally:
+                self.stt.unload()
+
+        self.set_task("Transcribing on this PC…")
+        worker = FunctionWorker(transcribe, audio)
+        worker.signals.result.connect(self.on_transcript)
+        worker.signals.error.connect(lambda e: self.set_task(f"Voice input failed: {e}"))
+        self._keep.add(worker)
+        self.threads.start(worker)
+
+    def on_transcript(self, text):
+        self.input.setPlainText(text)
+        self.speak_next_reply = True
+        self.send()
+
+    def speak(self, text):
+        voice = self.db.get("piper_voice", "")
+        if self.low_memory or not voice:
+            return
+        from voice.tts import speak
+        worker = FunctionWorker(speak, text, voice)
+        worker.signals.error.connect(lambda e: self.set_task(f"Couldn't speak the reply: {e}"))
+        self._keep.add(worker)
+        self.threads.start(worker)

@@ -1,0 +1,21 @@
+{
+  "_note": "Order in 'tasks' is the order providers are tried. 'local' is always the last resort. Check model ids in your Groq console / Google AI Studio.",
+  "providers": {
+    "groq": {
+      "label": "Groq",
+      "model": "openai/gpt-oss-120b",
+      "key_name": "GROQ_API_KEY",
+      "quota_cooldown_minutes": 60
+    },
+    "gemini": {
+      "label": "Gemini",
+      "model": "gemini-flash-latest",
+      "key_name": "GEMINI_API_KEY",
+      "quota_resets": "midnight_pacific"
+    }
+  },
+  "tasks": {
+    "chat": ["groq", "gemini", "local"],
+    "web": ["gemini", "groq", "local"]
+  }
+}
