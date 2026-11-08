@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.test-data/
 .mypy_cache/
 .ruff_cache/
 
@@ -15,6 +16,7 @@ ENV/
 # Local app data and runtime logs
 data/
 logs/
+debug.log
 *.db
 *.db-shm
 *.db-wal

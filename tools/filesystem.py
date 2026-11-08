@@ -1,5 +1,6 @@
 from pathlib import Path
 from security.path_security import PathSecurity
+from core.text_similarity import fuzzy_contains
 
 TEXT_EXTENSIONS={".txt",".md",".py",".cpp",".h",".java",".json",".csv",".log",".yaml",".yml",".toml",".ini"}
 EXECUTABLE_EXTENSIONS={".exe",".bat",".cmd",".ps1",".py",".pyw",".lnk",".msi",".vbs",".js",".com"}
@@ -12,7 +13,7 @@ class FilesystemTools:
         ext=extension.casefold(); needle=query.casefold()
         matches=[]
         for item in root.iterdir():
-            if (not ext or item.suffix.casefold()==ext) and (not needle or needle in item.name.casefold()):
+            if (not ext or item.suffix.casefold()==ext) and (not needle or fuzzy_contains(item.name,needle)):
                 matches.append({"name":item.name,"path":str(item),"type":"folder" if item.is_dir() else "file"})
         return matches[:100]
     def find_files(self,directory,query,extension=""):
@@ -22,7 +23,7 @@ class FilesystemTools:
             dirs[:]=[d for d in dirs if not d.startswith(".")]
             for name in files:
                 p=Path(base)/name
-                if needle in name.casefold() and (not ext or p.suffix.casefold()==ext):
+                if fuzzy_contains(name,needle) and (not ext or p.suffix.casefold()==ext):
                     out.append({"name":name,"path":str(p)})
                     if len(out)>=100:return out
         return out

@@ -14,7 +14,7 @@ for candidate in (Path.home() / "Projects", Path.home() / "source" / "repos"):
         ALLOWED_ROOTS.append(candidate)
 
 APPLICATIONS = {
-    "chrome": {"label": "Chrome", "candidates": [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", "chrome.exe"], "process": "chrome.exe"},
+    "chrome": {"label": "Chrome", "candidates": [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", str(Path.home() / "AppData/Local/Google/Chrome/Application/chrome.exe"), "chrome.exe"], "process": "chrome.exe"},
     "vscode": {"label": "VS Code", "candidates": [str(Path.home() / "AppData/Local/Programs/Microsoft VS Code/Code.exe"), "code.exe"], "process": "Code.exe"},
     "notepad": {"label": "Notepad", "candidates": ["notepad.exe"], "process": "Notepad.exe"},
     "calculator": {"label": "Calculator", "candidates": ["calc.exe"], "process": "CalculatorApp.exe"},
